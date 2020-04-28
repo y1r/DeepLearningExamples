@@ -16,54 +16,46 @@
 
 """BERT finetuning runner."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
+from concurrent.futures import ProcessPoolExecutor
 
-# ==================
-import time
 import argparse
-import random
-import h5py
-from tqdm import tqdm
 import os
+import random
+import time
+
+from apex import amp
+from apex.optimizers import FusedLAMB
+from apex.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, RandomSampler, Dataset
+from tqdm import tqdm
+
+import dllogger
+import h5py
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, RandomSampler, Dataset
-from apex import amp
 
 try:
     from . import modeling
+    from .schedulers import PolyWarmUpScheduler
+    from .utils import is_main_process, format_step
 except ImportError:
     import modeling
-
-from apex.optimizers import FusedLAMB
-try:
-    from .schedulers import PolyWarmUpScheduler
-except ImportError:
     from schedulers import PolyWarmUpScheduler
-
-try:
-    from .utils import is_main_process, format_step
-except ImportError
     from utils import is_main_process, format_step
-from apex.parallel import DistributedDataParallel as DDP
-
-import dllogger
-from concurrent.futures import ProcessPoolExecutor
 
 torch._C._jit_set_profiling_mode(False)
 torch._C._jit_set_profiling_executor(False)
 
-skipped_steps = 0
 
 #Workaround because python functions are not picklable
 class WorkerInitObj(object):
     def __init__(self, seed):
         self.seed = seed
+
     def __call__(self, id):
         np.random.seed(seed=self.seed + id)
         random.seed(self.seed + id)
+
 
 def create_pretraining_dataset(input_file, max_pred_length, shared_list, args, worker_init):
     train_data = pretraining_dataset(input_file=input_file, max_pred_length=max_pred_length)
@@ -74,8 +66,8 @@ def create_pretraining_dataset(input_file, max_pred_length, shared_list, args, w
                                   pin_memory=True)
     return train_dataloader, input_file
 
-class pretraining_dataset(Dataset):
 
+class pretraining_dataset(Dataset):
     def __init__(self, input_file, max_pred_length):
         self.input_file = input_file
         self.max_pred_length = max_pred_length
@@ -90,7 +82,6 @@ class pretraining_dataset(Dataset):
         return len(self.inputs[0])
 
     def __getitem__(self, index):
-
         [input_ids, input_mask, segment_ids, masked_lm_positions, masked_lm_ids, next_sentence_labels] = [
             torch.from_numpy(input[index].astype(np.int64)) if indice < 5 else torch.from_numpy(
                 np.asarray(input[index].astype(np.int64))) for indice, input in enumerate(self.inputs)]
@@ -105,11 +96,14 @@ class pretraining_dataset(Dataset):
 
         return [input_ids, segment_ids, input_mask,
                 masked_lm_labels, next_sentence_labels]
+
+
 class BertPretrainingCriterion(torch.nn.Module):
     def __init__(self, vocab_size):
         super(BertPretrainingCriterion, self).__init__()
         self.loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-1)
         self.vocab_size = vocab_size
+
     def forward(self, prediction_scores, seq_relationship_score, masked_lm_labels, next_sentence_labels):
         masked_lm_loss = self.loss_fn(prediction_scores.view(-1, self.vocab_size), masked_lm_labels.view(-1))
         next_sentence_loss = self.loss_fn(seq_relationship_score.view(-1, 2), next_sentence_labels.view(-1))
@@ -118,7 +112,6 @@ class BertPretrainingCriterion(torch.nn.Module):
 
 
 def parse_arguments():
-
     parser = argparse.ArgumentParser()
 
     ## Required parameters
@@ -219,10 +212,6 @@ def parse_arguments():
                         default=False,
                         action='store_true',
                         help="Whether to train with seq len 512")
-    parser.add_argument('--allreduce_post_accumulation_fp16',
-                        default=False,
-                        action='store_true',
-                        help="Whether to do fp16 allreduce post accumulation.")
     parser.add_argument('--phase1_end_step',
                         type=int,
                         default=7038,
@@ -245,8 +234,8 @@ def parse_arguments():
     
     return args
 
-def setup_training(args):
 
+def setup_training(args):
     assert (torch.cuda.is_available())
 
     if args.local_rank == -1:
@@ -282,6 +271,7 @@ def setup_training(args):
         os.makedirs(args.output_dir, exist_ok=True)
 
     return device, args
+
 
 def prepare_model_and_optimizer(args, device):
 
@@ -368,19 +358,8 @@ def prepare_model_and_optimizer(args, device):
 
     return model, optimizer, lr_scheduler, checkpoint, global_step, criterion
 
-def take_optimizer_step(args, optimizer, model, overflow_buf, global_step):
-
-    global skipped_steps
-    optimizer.step()
-    #optimizer.zero_grad()
-    for param in model.parameters():
-        param.grad = None
-    global_step += 1
-
-    return global_step
 
 def main():
-
     args = parse_arguments()
 
     if args.use_env and 'LOCAL_RANK' in os.environ:
@@ -418,7 +397,6 @@ def main():
 
         # Note: We loop infinitely over epochs, termination is handled via iteration count
         while True:
-            thread = None
             if not args.resume_from_checkpoint or epoch > 0 or (args.phase2 and global_step < 1) or args.init_checkpoint:
                 files = [os.path.join(args.input_dir, f) for f in os.listdir(args.input_dir) if
                          os.path.isfile(os.path.join(args.input_dir, f)) and 'training' in f]
@@ -441,8 +419,6 @@ def main():
             else:
                 data_file = files[(f_start_id*torch.distributed.get_world_size()+torch.distributed.get_rank())%num_files]
 
-            previous_file = data_file
-
             train_data = pretraining_dataset(data_file, args.max_predictions_per_seq)
             train_sampler = RandomSampler(train_data)
             train_dataloader = DataLoader(train_data, sampler=train_sampler,
@@ -450,8 +426,6 @@ def main():
                                           num_workers=4, worker_init_fn=worker_init,
                                           pin_memory=True)
             # shared_file_list["0"] = (train_dataloader, data_file)
-
-            overflow_buf = None
 
             if len(files) == 1:
                 f_start_id = -1
@@ -462,8 +436,6 @@ def main():
                     data_file = files[(f_id*torch.distributed.get_world_size()+torch.distributed.get_rank() + remainder*f_id)%num_files]
                 else:
                     data_file = files[(f_id*torch.distributed.get_world_size()+torch.distributed.get_rank())%num_files]
-
-                previous_file = data_file
 
                 dataset_future = pool.submit(create_pretraining_dataset, data_file, args.max_predictions_per_seq, shared_file_list, args, worker_init)
 
@@ -486,7 +458,12 @@ def main():
                     average_loss += loss.item()
 
                     lr_scheduler.step()  # learning rate warmup
-                    global_step = take_optimizer_step(args, optimizer, model, overflow_buf, global_step)
+
+                    optimizer.step()
+                    # optimizer.zero_grad()
+                    for param in model.parameters():
+                        param.grad = None
+                    global_step += 1
 
                     if global_step >= args.max_steps:
                         train_time_raw = time.time() - raw_train_start
@@ -543,7 +520,6 @@ def main():
 
 
 if __name__ == "__main__":
-
     now = time.time()
     args, final_loss, train_time_raw = main()
     gpu_count = args.n_gpu
@@ -554,7 +530,7 @@ if __name__ == "__main__":
         gpu_count = torch.distributed.get_world_size()
     if is_main_process():
         e2e_time = time.time() - now
-        training_perf = args.train_batch_size * gpu_count * (args.max_steps - args.resume_step + skipped_steps) / train_time_raw
+        training_perf = args.train_batch_size * gpu_count * (args.max_steps - args.resume_step) / train_time_raw
         dllogger.log(step=tuple(), data={"e2e_train_time": e2e_time, "training_sequences_per_second": training_perf,
                                          "final_loss": final_loss, "raw_train_time": train_time_raw })
     dllogger.flush()
